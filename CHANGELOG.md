@@ -5,6 +5,7 @@
 ### Added
 
 - `ltx-trainer`: `acceleration.quantization: fp8-cast` trains LoRA adapters over a base stored as `float8_e4m3fn` through ltx-core's fp8-cast policy, the same storage inference uses. The transformer is built straight on the GPU with no quantization pass and no tensor-subclass dispatch, so it loads in about a third of the time of `int8-quanto` at the same memory, steps about 15% faster, and works with `torch.compile`. `load_transformer()` takes an optional `quantization` policy.
+- `ltx-trainer`: `acceleration.compile_transformer_blocks` compiles every transformer block's forward with `torch.compile(dynamic=True)` (about 2x faster steps on an RTX 5090 with `int8-quanto` or `fp8-cast`, one compilation on the first step); `acceleration.keep_quantized_model_on_gpu` skips the CPU round trip after quanto quantization; `acceleration.metrics_sync_interval` reads the loss and sigma back to the host every N steps instead of every step. All three default off.
 
 ### Fixed
 

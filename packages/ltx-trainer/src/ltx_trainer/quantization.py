@@ -117,6 +117,7 @@ def quantize_model(
     precision: QuantizationOptions,
     quantize_activations: bool = False,
     device: torch.device | str | None = None,
+    keep_on_device: bool = False,
 ) -> torch.nn.Module:
     """
     Quantize a model using optimum-quanto.
@@ -128,6 +129,8 @@ def quantize_model(
         precision: The quantization precision (e.g. "int8-quanto", "fp8-quanto").
         quantize_activations: Whether to quantize activations in addition to weights.
         device: Device to use for quantization. If None, uses CUDA if available, else CPU.
+        keep_on_device: Leave the quantized model on ``device`` instead of returning it to the device it
+            came from. Saves two transfers of the model when it is about to be trained on ``device`` anyway.
     Returns:
         The quantized model.
     """
@@ -163,6 +166,7 @@ def quantize_model(
             weight_quant=weight_quant,
             activations_quant=activations_quant,
             device=device,
+            keep_on_device=keep_on_device,
         )
     else:
         # Fallback: quantize entire model at once
@@ -171,7 +175,8 @@ def quantize_model(
         freeze(model)
 
     # Restore model to original device
-    model.to(original_device)
+    if not keep_on_device:
+        model.to(original_device)
 
     return model
 
@@ -181,6 +186,7 @@ def _quantize_blockwise(
     weight_quant: torch.dtype,
     activations_quant: torch.dtype | None,
     device: torch.device,
+    keep_on_device: bool = False,
 ) -> None:
     """Quantize a model block-by-block using optimum-quanto.
     This approach:
@@ -214,7 +220,8 @@ def _quantize_blockwise(
             freeze(block)
 
             # Move back to CPU to free up VRAM for next block
-            block.to("cpu", non_blocking=True)
+            if not keep_on_device:
+                block.to("cpu", non_blocking=True)
 
             progress.advance(task)
 
@@ -234,7 +241,8 @@ def _quantize_blockwise(
         module.to(device, dtype=original_dtype, non_blocking=True)
         quantize(module, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
         freeze(module)
-        module.to("cpu", non_blocking=True)
+        if not keep_on_device:
+            module.to("cpu", non_blocking=True)
 
 
 def _get_quanto_dtype(precision: QuantizationOptions) -> torch.dtype:

@@ -406,6 +406,28 @@ class AccelerationConfig(ConfigBaseModel):
         "for FSDP (sharded state). Disabled by default.",
     )
 
+    compile_transformer_blocks: bool = Field(
+        default=False,
+        description="Compile every transformer block's forward with torch.compile(dynamic=True). One-off "
+        "compilation on the first step (tens of seconds); afterwards one artifact serves every sequence "
+        "length. Works with every quantization option and with an unquantized base.",
+    )
+
+    keep_quantized_model_on_gpu: bool = Field(
+        default=False,
+        description="After block-wise quanto quantization keep the quantized blocks on the GPU instead of "
+        "moving them back to the CPU until Accelerate prepares the model. Saves two PCIe passes of the "
+        "model at startup. Leave off under FSDP, which shards the model from the CPU.",
+    )
+
+    metrics_sync_interval: int = Field(
+        default=1,
+        ge=1,
+        description="Read the loss and sigma back to the host every N optimization steps (always on the "
+        "last). Each read synchronizes the GPU and keeps the CPU from queueing the next step; 1 keeps "
+        "per-step logging.",
+    )
+
 
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""

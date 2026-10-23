@@ -311,6 +311,9 @@ acceleration:
   quantization: null                            # Quantization options
   load_text_encoder_in_8bit: false              # Load text encoder in 8-bit
   offload_optimizer_during_validation: false    # Offload optimizer state to CPU during validation
+  compile_transformer_blocks: false             # torch.compile every transformer block
+  keep_quantized_model_on_gpu: false            # Skip the CPU round trip after quanto quantization
+  metrics_sync_interval: 1                      # Read loss/sigma back to the host every N steps
 ```
 
 **Key parameters:**
@@ -321,6 +324,9 @@ acceleration:
 | `quantization`                        | Base-model quantization (LoRA training only): `null`, `"fp8-cast"`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`. See below.                   |
 | `load_text_encoder_in_8bit`           | Quantize the Gemma text encoder to 8-bit, saving ~8 GiB of VRAM while caption embeddings are computed. Works with both checkpoint layouts. Requires `bitsandbytes` and a CUDA device, and materializes the full-precision weights in host RAM first (~26 GB for LTX 2.5). **This can potentially degrade the cached caption features.** |
 | `offload_optimizer_during_validation` | Move optimizer state to CPU before validation video sampling and back afterwards. Useful when validation OOMs because VAE decoder + transformer + optimizer state can't coexist on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP. |
+| `compile_transformer_blocks`          | Compile every transformer block's forward with `torch.compile(dynamic=True)`. The first step pays the compilation (about 40 s for LTX 2.5 at batch 1, longer at larger batches); afterwards one artifact serves every sequence length. Measured about 2x faster steps on an RTX 5090 with `int8-quanto` and with `fp8-cast` on an audio-only LoRA, 1.6x on an audiovisual one. Works with every quantization option. |
+| `keep_quantized_model_on_gpu`         | After block-wise quanto quantization keep the quantized blocks on the GPU instead of moving them back to the CPU until Accelerate prepares the model. Saves two PCIe passes of the model at startup (about 10 s on a PCIe 4.0 x16 link, far more on narrower links). Leave off under FSDP, which shards the model from the CPU. |
+| `metrics_sync_interval`               | Read the loss and sigma back to the host every N optimization steps (always on the last). Each read is a full GPU synchronization that stops the CPU from queueing the next step; with small steps this shows up as idle GPU time. 1 keeps per-step logging. |
 
 **`fp8-cast` versus the quanto options.** The quanto options load the bf16 checkpoint into host RAM and then
 quantize it block by block; each quantized Linear is a tensor subclass that dequantizes on every call. `fp8-cast`

@@ -1,10 +1,11 @@
 import contextlib
+import importlib
 import math
 import os
 import re
 import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -91,6 +92,27 @@ class TrainingStepOutput:
 
     loss: Tensor  # [B,] per-element loss (unreduced)
     sigma: Tensor  # [B,] sampled sigma, detached from computational graph
+
+
+def metrics_due(step: int, interval: int, total_steps: int) -> bool:
+    """Whether optimization step ``step`` reads its metrics back to the host: every ``interval`` steps, and on the
+    last step so the final loss is always logged."""
+    return interval <= 1 or step % interval == 0 or step >= total_steps
+
+
+def compile_block_forwards(blocks: Iterable[torch.nn.Module], backend: str = "inductor") -> int:
+    """Replace each block's ``forward`` with a ``torch.compile(dynamic=True)`` wrapper of it. Returns the count.
+    Compiling the bound method, not the module, leaves the module tree and its ``state_dict`` keys untouched, so
+    LoRA checkpoints keep their names. One compiled artifact serves every sequence length (dynamic shapes), and
+    the dynamo cache limit is raised so a block per layer does not evict earlier ones.
+    """
+    dynamo = importlib.import_module("torch._dynamo")
+    dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 64)
+    count = 0
+    for block in blocks:
+        block.forward = torch.compile(block.forward, backend=backend, dynamic=True)
+        count += 1
+    return count
 
 
 def apply_embeddings_connectors(
@@ -233,6 +255,8 @@ class LtxvTrainer:
         self._global_step = initial_step
 
         peak_mem_during_training = start_mem
+        metrics_interval = cfg.acceleration.metrics_sync_interval
+        step_loss = float("nan")
 
         sampled_videos_paths = None
 
@@ -302,7 +326,9 @@ class LtxvTrainer:
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
-                    step_loss = output.loss.detach().mean().item()
+                    log_metrics = metrics_due(self._global_step, metrics_interval, cfg.optimization.steps)
+                    if log_metrics:
+                        step_loss = output.loss.detach().mean().item()
 
                     progress.update_training(
                         loss=step_loss,
@@ -312,7 +338,7 @@ class LtxvTrainer:
                     )
 
                     # Log metrics to W&B (only on main process and optimization steps)
-                    if IS_MAIN_PROCESS and is_optimization_step:
+                    if IS_MAIN_PROCESS and is_optimization_step and log_metrics:
                         # Track per-element loss by sigma bucket
                         self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
                         metrics = {
@@ -475,6 +501,7 @@ class LtxvTrainer:
             self._transformer = quantize_model(
                 self._transformer,
                 precision=quantization,
+                keep_on_device=self._config.acceleration.keep_quantized_model_on_gpu,
             )
 
         self._transformer.requires_grad_(False)
@@ -665,6 +692,10 @@ class LtxvTrainer:
         )
 
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
+
+        if self._config.acceleration.compile_transformer_blocks:
+            compiled = compile_block_forwards(transformer.transformer_blocks)
+            logger.info(f"Compiling {compiled} transformer block forwards with torch.compile (first step is slow)")
 
         # noinspection PyTypeChecker
         self._transformer = self._accelerator.prepare(self._transformer)
