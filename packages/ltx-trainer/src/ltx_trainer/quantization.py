@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 QuantizationOptions = Literal[
     "fp8-cast",
+    "int8-cast",
     "int8-quanto",
     "int4-quanto",
     "int2-quanto",
@@ -67,6 +68,58 @@ def fp8_cast_policy(checkpoint_path: str | Path) -> "QuantizationPolicy":
     from ltx_core.quantization.fp8_cast import build_policy  # noqa: PLC0415
 
     return build_policy(str(checkpoint_path))
+
+
+def int8_cast_policy(checkpoint_path: str | Path | None = None) -> "QuantizationPolicy":  # noqa: ARG001
+    """ltx-core's int8-cast policy: the transformer-block Linears are stored as int8 with one bf16 scale per output
+    row, written while the checkpoint streams in, and dequantized inside a class-level forward
+    (``Int8CastLinear``). The recipe is optimum-quanto's absmax int8, so the weights are what ``int8-quanto`` trains
+    against, bit for bit, without the tensor subclass. ``checkpoint_path`` is accepted for a uniform signature with
+    :func:`fp8_cast_policy`; the bf16 checkpoint needs nothing read ahead of time.
+    """
+    from ltx_core.quantization.int8_cast import build_policy  # noqa: PLC0415
+
+    return build_policy()
+
+
+class _Int8FrozenLinearFunction(torch.autograd.Function):
+    """Linear over a frozen per-row int8 weight: dequantize for the forward GEMM, save only the int8 weight and its
+    scale, dequantize again for the input gradient. No weight or bias gradient: the base model is frozen."""
+
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx, x: torch.Tensor, weight8: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        ctx.save_for_backward(weight8, scale)
+        bias = bias.to(x.dtype) if bias is not None else None
+        return torch.nn.functional.linear(x, weight8.to(x.dtype) * scale.to(x.dtype)[:, None], bias)
+
+    @staticmethod
+    def backward(ctx: FunctionCtx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        weight8, scale = ctx.saved_tensors
+        return grad_out.matmul(weight8.to(grad_out.dtype) * scale.to(grad_out.dtype)[:, None]), None, None, None
+
+
+def _int8_train_forward(self: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return _Int8FrozenLinearFunction.apply(x, self.weight, self.weight_scale, self.bias)
+
+
+def prepare_int8_cast_linears_for_lora(model: torch.nn.Module) -> int:
+    """Make a model loaded with :func:`int8_cast_policy` ready for LoRA training. Returns the layer count.
+    Same two steps as :func:`prepare_fp8_cast_linears_for_lora`: a ``compute_dtype`` so PEFT creates bf16 (then
+    fp32) adapters rather than int8 ones, and a class-level forward whose backward saves the int8 weight and scale
+    instead of the dequantized bf16 copy.
+    """
+    from ltx_core.quantization.int8_cast import Int8CastLinear  # noqa: PLC0415
+
+    train_cls = type("Int8CastLinearTrain", (Int8CastLinear,), {"forward": _int8_train_forward})
+    count = 0
+    for module in model.modules():
+        if type(module) is Int8CastLinear:
+            module.__class__ = train_cls
+            module.compute_dtype = torch.bfloat16
+            count += 1
+    return count
 
 
 class _Fp8FrozenLinearFunction(torch.autograd.Function):
@@ -134,10 +187,10 @@ def quantize_model(
     Returns:
         The quantized model.
     """
-    if precision == "fp8-cast":
+    if precision in ("fp8-cast", "int8-cast"):
         raise ValueError(
-            "fp8-cast is applied while the checkpoint loads: pass fp8_cast_policy(...) to load_transformer() "
-            "instead of calling quantize_model()."
+            f"{precision} is applied while the checkpoint loads: pass {precision.replace('-', '_')}_policy(...) to "
+            "load_transformer() instead of calling quantize_model()."
         )
 
     from optimum.quanto import freeze, quantize  # noqa: PLC0415

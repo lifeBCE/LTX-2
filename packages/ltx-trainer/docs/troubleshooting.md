@@ -76,11 +76,11 @@ Use quantization to reduce memory usage:
 
 ```yaml
 acceleration:
-  quantization: "int8-quanto"  # Options: fp8-cast, int8-quanto, int4-quanto, fp8-quanto
+  quantization: "int8-quanto"  # Options: fp8-cast, int8-cast, int8-quanto, int4-quanto, fp8-quanto
 ```
 
 `fp8-cast` uses the same memory as `int8-quanto` but loads faster (no quantization pass) and steps about 15% faster
-uncompiled; `int8-quanto` keeps more of the base weights' precision. See the
+uncompiled; `int8-cast` keeps `int8-quanto`'s weights bit for bit in a plain layer with the same speed as `fp8-cast`. See the
 [configuration reference](configuration-reference.md#accelerationconfig).
 
 #### 6. Use 8-bit Optimizer

@@ -48,7 +48,13 @@ from ltx_trainer.model_loader import (
     resolve_video_vae_path,
 )
 from ltx_trainer.progress import TrainingProgress
-from ltx_trainer.quantization import fp8_cast_policy, prepare_fp8_cast_linears_for_lora, quantize_model
+from ltx_trainer.quantization import (
+    fp8_cast_policy,
+    int8_cast_policy,
+    prepare_fp8_cast_linears_for_lora,
+    prepare_int8_cast_linears_for_lora,
+    quantize_model,
+)
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
@@ -448,7 +454,11 @@ class LtxvTrainer:
         quantization = self._config.acceleration.quantization
         if quantization is not None and self._config.model.training_mode == "full":
             raise ValueError("Quantization is not supported in full training mode.")
-        fp8_cast = quantization == "fp8-cast"
+        # Bases quantized while the checkpoint streams in (ltx-core policies), then prepared for LoRA.
+        load_time_cast = {
+            "fp8-cast": (fp8_cast_policy, prepare_fp8_cast_linears_for_lora),
+            "int8-cast": (int8_cast_policy, prepare_int8_cast_linears_for_lora),
+        }.get(quantization)
 
         # DDP-safe: LOCAL_RANK is set by accelerate before trainer init. Loading on bare
         # "cuda" would resolve to cuda:0 on every rank and crash with a device mismatch.
@@ -456,18 +466,19 @@ class LtxvTrainer:
         init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
         logger.debug("Loading transformer...")
-        if fp8_cast:
-            # The policy writes the block Linears as float8 while the checkpoint streams in, so the model is
-            # built straight on the training device: no bf16 copy of the transformer in host RAM and no
-            # separate quantization pass.
+        if load_time_cast is not None:
+            build_policy, prepare_for_lora = load_time_cast
+            # The policy quantizes the block Linears while the checkpoint streams in, so the model is built
+            # straight on the training device: no bf16 copy of the transformer in host RAM and no separate
+            # quantization pass.
             self._transformer = load_transformer(
                 checkpoint_path=self._config.model.model_path,
                 device=init_device,
                 dtype=torch.bfloat16,
-                quantization=fp8_cast_policy(self._config.model.model_path),
+                quantization=build_policy(self._config.model.model_path),
             )
-            fp8_layers = prepare_fp8_cast_linears_for_lora(self._transformer)
-            logger.info(f"Loaded transformer with {fp8_layers} float8 (fp8-cast) Linear layers")
+            cast_layers = prepare_for_lora(self._transformer)
+            logger.info(f"Loaded transformer with {cast_layers} {quantization} Linear layers")
         else:
             self._transformer = load_transformer(
                 checkpoint_path=self._config.model.model_path,
@@ -491,12 +502,12 @@ class LtxvTrainer:
         # reads, and autograd keeps their activations alive until that backward.
         self._embeddings_processor.requires_grad_(False)
 
-        if not fp8_cast:
+        if load_time_cast is None:
             # (A dtype cast here would upcast fp8-cast weights back to bf16.)
             transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
             self._transformer = self._transformer.to(dtype=transformer_dtype)
 
-        if quantization is not None and not fp8_cast:
+        if quantization is not None and load_time_cast is None:
             logger.info(f'Quantizing model with "{quantization}". This may take a while...')
             self._transformer = quantize_model(
                 self._transformer,

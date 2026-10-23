@@ -321,7 +321,7 @@ acceleration:
 | Parameter                             | Description                                                                                                                                                                              |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `mixed_precision_mode`                | Precision mode - `"bf16"` recommended for modern GPUs                                                                                                                                    |
-| `quantization`                        | Base-model quantization (LoRA training only): `null`, `"fp8-cast"`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`. See below.                   |
+| `quantization`                        | Base-model quantization (LoRA training only): `null`, `"fp8-cast"`, `"int8-cast"`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`. See below.                   |
 | `load_text_encoder_in_8bit`           | Quantize the Gemma text encoder to 8-bit, saving ~8 GiB of VRAM while caption embeddings are computed. Works with both checkpoint layouts. Requires `bitsandbytes` and a CUDA device, and materializes the full-precision weights in host RAM first (~26 GB for LTX 2.5). **This can potentially degrade the cached caption features.** |
 | `offload_optimizer_during_validation` | Move optimizer state to CPU before validation video sampling and back afterwards. Useful when validation OOMs because VAE decoder + transformer + optimizer state can't coexist on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP. |
 | `compile_transformer_blocks`          | Compile every transformer block's forward with `torch.compile(dynamic=True)`. The first step pays the compilation (about 40 s for LTX 2.5 at batch 1, longer at larger batches); afterwards one artifact serves every sequence length. Measured about 2x faster steps on an RTX 5090 with `int8-quanto` and with `fp8-cast` on an audio-only LoRA, 1.6x on an audiovisual one. Works with every quantization option. |
@@ -336,6 +336,14 @@ needs no extra dependency, skips the quantization pass (about 10 s to first step
 35 s), and the layers are ordinary `nn.Linear` modules. Memory is the same
 one byte per weight as `int8-quanto`; on an RTX 5090 the training step was about 15% faster. LoRA adapters are
 created in bf16 and trained in fp32 as usual. Requires a GPU for loading (the float8 cast runs on the device).
+
+**`int8-cast`** is the same load-time mechanism with int8 storage: one symmetric scale per output row, computed
+with optimum-quanto's absmax recipe, so the stored weights are exactly what `int8-quanto` trains against while the
+layer stays a plain `nn.Linear`. It keeps about five times more weight precision than `fp8-cast` at the same byte
+per weight, needs no quantization pass and no quanto dispatch, and compiles like `fp8-cast`. On an RTX 5090 the
+compiled step matched `fp8-cast` (0.20 s audio-only, 1.23 s audiovisual at 576x576x73) and was 12% faster than
+compiled `int8-quanto` on the audio-only config. Prefer it over `fp8-cast` when precision matters more than the
+fp8 storage shared with inference.
 
 ### DataConfig
 
