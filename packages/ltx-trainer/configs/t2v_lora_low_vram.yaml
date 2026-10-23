@@ -180,7 +180,7 @@ acceleration:
   mixed_precision_mode: "bf16"
 
   # Model quantization for reduced memory usage
-  # Options: null (none), "int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"
+  # Options: null (none), "fp8-cast", "fp8-gemm", "int8-cast", "int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"
   # Using INT8 quantization to reduce base model memory consumption by ~50%
   quantization: "int8-quanto"
 

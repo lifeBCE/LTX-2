@@ -30,9 +30,12 @@ Device = str | torch.device
 # Type checking imports (not loaded at runtime)
 if TYPE_CHECKING:
     from ltx_core.components.schedulers import LTX2Scheduler
+    from ltx_core.loader.module_ops import ModuleOps
+    from ltx_core.loader.sd_ops import SDOps
     from ltx_core.model.audio_vae import AudioDecoder, AudioEncoder, Vocoder
     from ltx_core.model.transformer import LTXModel
     from ltx_core.model.video_vae import VideoDecoder, VideoEncoder
+    from ltx_core.quantization import QuantizationPolicy
     from ltx_core.text_encoders.gemma import LTXGemmaTextEncoder
     from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
     from ltx_core.types import SpatioTemporalScaleFactors
@@ -142,16 +145,42 @@ def _resolve_component_path(
 # =============================================================================
 
 
+def with_quantization_policy(
+    model_sd_ops: "SDOps",
+    module_ops: "tuple[ModuleOps, ...]",
+    quantization: "QuantizationPolicy | None",
+) -> "tuple[SDOps, tuple[ModuleOps, ...]]":
+    """Chain a quantization policy's load-time ops after a model's own state-dict ops and module ops.
+    The policy's state-dict ops run after the renaming map (so they see post-rename keys) and its module ops are
+    appended, mirroring how ``ltx-pipelines`` builds its diffusion stages. ``None`` leaves both unchanged.
+    """
+    from ltx_core.loader.sd_ops import SDOps
+
+    if quantization is None:
+        return model_sd_ops, module_ops
+    chained = model_sd_ops
+    if quantization.sd_ops is not None:
+        chained = SDOps(
+            name=f"sd_ops_chain_{model_sd_ops.name}+{quantization.sd_ops.name}",
+            mapping=(*model_sd_ops.mapping, *quantization.sd_ops.mapping),
+        )
+    return chained, (*module_ops, *quantization.module_ops)
+
+
 def load_transformer(
     checkpoint_path: str | Path,
     device: Device = "cpu",
     dtype: torch.dtype = torch.bfloat16,
+    quantization: "QuantizationPolicy | None" = None,
 ) -> "LTXModel":
     """Load the LTX transformer model.
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         device: Device to load model on
         dtype: Data type for model weights
+        quantization: Optional ltx-core quantization policy applied while loading (for example
+            :func:`ltx_trainer.quantization.fp8_cast_policy`). Its state-dict ops run after the Comfy
+            renaming map and its module ops retype the meta model before the weights land.
     Returns:
         Loaded LTXModel transformer
     """
@@ -161,10 +190,12 @@ def load_transformer(
         LTXModelConfigurator,
     )
 
+    model_sd_ops, module_ops = with_quantization_policy(LTXV_MODEL_COMFY_RENAMING_MAP, (), quantization)
     return SingleGPUModelBuilder(
         model_path=str(checkpoint_path),
         model_class_configurator=LTXModelConfigurator,
-        model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+        model_sd_ops=model_sd_ops,
+        module_ops=module_ops,
     ).build(device=_to_torch_device(device), dtype=dtype)
 
 

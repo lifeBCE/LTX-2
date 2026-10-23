@@ -67,7 +67,7 @@ packages/ltx-trainer/
 │   │   └── video_to_video.py     # VideoToVideoStrategy, VideoToVideoConfig [DEPRECATED]
 │   ├── timestep_samplers.py      # Flow matching timestep sampling
 │   ├── gemma_8bit.py             # 8-bit Gemma text encoder quantization (bitsandbytes)
-│   ├── quantization.py           # Transformer INT8/INT4/FP8 quantization
+│   ├── quantization.py           # Transformer quantization: quanto INT8/INT4/FP8, and fp8-cast / fp8-gemm / int8-cast (ltx-core load-time storage)
 │   ├── captioning.py             # Video captioning utilities
 │   ├── video_utils.py            # Video I/O and processing
 │   ├── gpu_utils.py              # GPU memory helpers
@@ -143,8 +143,8 @@ The `configs/` directory is documented in two places that both contain a trainin
 2. `LtxvTrainer` class orchestrates the training loop
 3. Text encoder loaded on GPU → validation embeddings cached → heavy components unloaded (only `embeddings_processor`
    kept)
-4. Each training step: embedding connectors applied → strategy prepares `ModelInputs` → transformer forward pass →
-   strategy computes loss
+4. Each training step: embedding connectors applied (`apply_embeddings_connectors()`, frozen, no autograd) →
+   strategy prepares `ModelInputs` → transformer forward pass → strategy computes loss
 5. Training strategies (`FlexibleStrategy`) handle mode-specific logic including conditioning, masking, and loss computation
 6. Accelerate handles distributed training, mixed precision, and device placement
 7. Data flows as precomputed latents through `PrecomputedDataset`

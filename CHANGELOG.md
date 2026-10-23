@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `ltx-trainer`: `acceleration.quantization: fp8-cast` trains LoRA adapters over a base stored as `float8_e4m3fn` through ltx-core's fp8-cast policy, the same storage inference uses. The transformer is built straight on the GPU with no quantization pass and no tensor-subclass dispatch, so it loads in about a third of the time of `int8-quanto` at the same memory, steps about 15% faster, and works with `torch.compile`. `load_transformer()` takes an optional `quantization` policy.
+- `ltx-core`: `ltx_core.quantization.int8_cast`, an int8 twin of the fp8-cast policy. The transformer-block Linears are stored as int8 with one bf16 scale per output row (optimum-quanto's absmax recipe, so the weights equal `int8-quanto`'s bit for bit) in a plain `Int8CastLinear`, with a fuse rule that requantizes after a LoRA merge. `ltx-trainer` exposes it as `acceleration.quantization: int8-cast`: five times the weight precision of `fp8-cast` at the same memory, no quantization pass, and the same compiled step time.
+- `ltx-trainer`: `acceleration.quantization: fp8-gemm` trains over `fp8-cast` storage with the frozen base's GEMMs in float8: the block Linears become ltx-core's `Fp8RowwiseLinear` (per-row e4m3 activations through `torch._scaled_mm`) with a backward that computes the input gradient the same way. `acceleration.fp8_gemm_min_rows` (default 1024) sets the row count from which a Linear takes the float8 GEMM. Needs compute capability 8.9 or newer; on an RTX 5090 the compiled audiovisual step was 1.33x faster than `fp8-cast` with the same adapter quality.
+- `ltx-trainer`: `acceleration.compile_transformer_blocks` compiles every transformer block's forward with `torch.compile(dynamic=True)` (about 2x faster steps on an RTX 5090 with `int8-quanto` or `fp8-cast`, one compilation on the first step); `acceleration.keep_quantized_model_on_gpu` skips the CPU round trip after quanto quantization; `acceleration.metrics_sync_interval` reads the loss and sigma back to the host every N steps instead of every step. All three default off.
+
+### Fixed
+
+- `ltx-trainer` no longer runs a backward pass through the Gemma embeddings connectors on every training step. Their parameters defaulted to `requires_grad=True` although no optimizer reads their gradients; the embeddings processor is now frozen after loading and `create_embeddings` runs without autograd. On an RTX 5090 this cut peak training memory from 31.2 GB to 24.2 GB for a 576x576x73 audiovisual LoRA and from 25.5 GB to 22.0 GB for an audio-only one, and removed the connector backward from every step.
+
 ## 1.5.0 - 2026-10-18
 
 ### Added

@@ -1,10 +1,12 @@
 import contextlib
+import functools
+import importlib
 import math
 import os
 import re
 import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -31,7 +33,9 @@ from torch.optim.lr_scheduler import (
 )
 from torch.utils.data import DataLoader
 
+from ltx_core.quantization.fp8_cast import supports_fp8_gemm
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
@@ -46,7 +50,15 @@ from ltx_trainer.model_loader import (
     resolve_video_vae_path,
 )
 from ltx_trainer.progress import TrainingProgress
-from ltx_trainer.quantization import quantize_model
+from ltx_trainer.quantization import (
+    fp8_cast_policy,
+    fp8_gemm_policy,
+    int8_cast_policy,
+    prepare_fp8_cast_linears_for_lora,
+    prepare_fp8_gemm_linears_for_lora,
+    prepare_int8_cast_linears_for_lora,
+    quantize_model,
+)
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
@@ -90,6 +102,55 @@ class TrainingStepOutput:
 
     loss: Tensor  # [B,] per-element loss (unreduced)
     sigma: Tensor  # [B,] sampled sigma, detached from computational graph
+
+
+def metrics_due(step: int, interval: int, total_steps: int) -> bool:
+    """Whether optimization step ``step`` reads its metrics back to the host: every ``interval`` steps, and on the
+    last step so the final loss is always logged."""
+    return interval <= 1 or step % interval == 0 or step >= total_steps
+
+
+def compile_block_forwards(blocks: Iterable[torch.nn.Module], backend: str = "inductor") -> int:
+    """Replace each block's ``forward`` with a ``torch.compile(dynamic=True)`` wrapper of it. Returns the count.
+    Compiling the bound method, not the module, leaves the module tree and its ``state_dict`` keys untouched, so
+    LoRA checkpoints keep their names. One compiled artifact serves every sequence length (dynamic shapes), and
+    the dynamo cache limit is raised so a block per layer does not evict earlier ones.
+    """
+    dynamo = importlib.import_module("torch._dynamo")
+    dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 64)
+    count = 0
+    for block in blocks:
+        block.forward = torch.compile(block.forward, backend=backend, dynamic=True)
+        count += 1
+    return count
+
+
+def apply_embeddings_connectors(
+    embeddings_processor: EmbeddingsProcessor, conditions: dict[str, Tensor]
+) -> dict[str, Tensor]:
+    """Run the frozen Gemma connectors over a batch's cached caption features.
+    Accepts both cache formats: separate ``video_prompt_embeds`` / ``audio_prompt_embeds`` (from
+    ``precompute()``), or a single legacy ``prompt_embeds`` used for both modalities. Replaces the
+    features in ``conditions`` with the connector outputs and the mask with the connector's mask.
+    The connectors are not trained, so this runs without autograd: no graph is recorded through them,
+    the outputs carry no gradient, and the backward pass stops at the transformer's inputs.
+    """
+    if "video_prompt_embeds" in conditions:
+        video_features = conditions["video_prompt_embeds"]
+        audio_features = conditions.get("audio_prompt_embeds")
+    else:
+        video_features = conditions["prompt_embeds"]
+        audio_features = conditions["prompt_embeds"]
+
+    additive_mask = convert_to_additive_mask(conditions["prompt_attention_mask"], video_features.dtype)
+    with torch.no_grad():
+        video_embeds, audio_embeds, attention_mask = embeddings_processor.create_embeddings(
+            video_features, audio_features, additive_mask
+        )
+    conditions["video_prompt_embeds"] = video_embeds
+    conditions["audio_prompt_embeds"] = audio_embeds
+    conditions["prompt_attention_mask"] = attention_mask
+    return conditions
 
 
 class LtxvTrainer:
@@ -204,6 +265,8 @@ class LtxvTrainer:
         self._global_step = initial_step
 
         peak_mem_during_training = start_mem
+        metrics_interval = cfg.acceleration.metrics_sync_interval
+        step_loss = float("nan")
 
         sampled_videos_paths = None
 
@@ -273,7 +336,9 @@ class LtxvTrainer:
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
-                    step_loss = output.loss.detach().mean().item()
+                    log_metrics = metrics_due(self._global_step, metrics_interval, cfg.optimization.steps)
+                    if log_metrics:
+                        step_loss = output.loss.detach().mean().item()
 
                     progress.update_training(
                         loss=step_loss,
@@ -283,7 +348,7 @@ class LtxvTrainer:
                     )
 
                     # Log metrics to W&B (only on main process and optimization steps)
-                    if IS_MAIN_PROCESS and is_optimization_step:
+                    if IS_MAIN_PROCESS and is_optimization_step and log_metrics:
                         # Track per-element loss by sigma bucket
                         self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
                         metrics = {
@@ -364,27 +429,8 @@ class LtxvTrainer:
 
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
-        # Apply embedding connectors to transform pre-computed text embeddings
-        conditions = batch["conditions"]
-
-        if "video_prompt_embeds" in conditions:
-            # New format: separate video/audio features from precompute()
-            video_features = conditions["video_prompt_embeds"]
-            audio_features = conditions.get("audio_prompt_embeds")
-        else:
-            # Legacy format: single prompt_embeds tensor — duplicate for both modalities
-            video_features = conditions["prompt_embeds"]
-            audio_features = conditions["prompt_embeds"]
-
-        mask = conditions["prompt_attention_mask"]
-        additive_mask = convert_to_additive_mask(mask, video_features.dtype)
-        video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
-            video_features, audio_features, additive_mask
-        )
-
-        conditions["video_prompt_embeds"] = video_embeds
-        conditions["audio_prompt_embeds"] = audio_embeds
-        conditions["prompt_attention_mask"] = attention_mask
+        # Apply embedding connectors to transform pre-computed text embeddings (updates the batch in place)
+        apply_embeddings_connectors(self._embeddings_processor, batch["conditions"])
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
@@ -409,17 +455,49 @@ class LtxvTrainer:
 
     def _load_models(self) -> None:
         """Load the transformer and embeddings processor for training."""
-        logger.debug("Loading transformer...")
-        self._transformer = load_transformer(
-            checkpoint_path=self._config.model.model_path,
-            device="cpu",
-            dtype=torch.bfloat16,
-        )
+        quantization = self._config.acceleration.quantization
+        if quantization is not None and self._config.model.training_mode == "full":
+            raise ValueError("Quantization is not supported in full training mode.")
+        # Bases quantized while the checkpoint streams in (ltx-core policies), then prepared for LoRA.
+        load_time_cast = {
+            "fp8-cast": (fp8_cast_policy, prepare_fp8_cast_linears_for_lora),
+            "fp8-gemm": (
+                functools.partial(fp8_gemm_policy, min_rows=self._config.acceleration.fp8_gemm_min_rows),
+                prepare_fp8_gemm_linears_for_lora,
+            ),
+            "int8-cast": (int8_cast_policy, prepare_int8_cast_linears_for_lora),
+        }.get(quantization)
 
         # DDP-safe: LOCAL_RANK is set by accelerate before trainer init. Loading on bare
         # "cuda" would resolve to cuda:0 on every rank and crash with a device mismatch.
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+        logger.debug("Loading transformer...")
+        if load_time_cast is not None:
+            build_policy, prepare_for_lora = load_time_cast
+            # The policy quantizes the block Linears while the checkpoint streams in, so the model is built
+            # straight on the training device: no bf16 copy of the transformer in host RAM and no separate
+            # quantization pass.
+            self._transformer = load_transformer(
+                checkpoint_path=self._config.model.model_path,
+                device=init_device,
+                dtype=torch.bfloat16,
+                quantization=build_policy(self._config.model.model_path),
+            )
+            cast_layers = prepare_for_lora(self._transformer)
+            logger.info(f"Loaded transformer with {cast_layers} {quantization} Linear layers")
+            if quantization == "fp8-gemm" and not supports_fp8_gemm(init_device):
+                logger.warning(
+                    f"{init_device} has no float8 GEMMs (compute capability 8.9 or newer); fp8-gemm layers will upcast "
+                    "their weights like fp8-cast"
+                )
+        else:
+            self._transformer = load_transformer(
+                checkpoint_path=self._config.model.model_path,
+                device="cpu",
+                dtype=torch.bfloat16,
+            )
 
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
@@ -432,18 +510,22 @@ class LtxvTrainer:
             dtype=torch.bfloat16,
         )
         self._embeddings_processor.feature_extractor = None
+        # The connectors are never optimized, but their parameters default to requires_grad=True.
+        # Left trainable, every step runs a full backward through them for gradients no optimizer
+        # reads, and autograd keeps their activations alive until that backward.
+        self._embeddings_processor.requires_grad_(False)
 
-        transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
-        self._transformer = self._transformer.to(dtype=transformer_dtype)
+        if load_time_cast is None:
+            # (A dtype cast here would upcast fp8-cast weights back to bf16.)
+            transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
+            self._transformer = self._transformer.to(dtype=transformer_dtype)
 
-        if self._config.acceleration.quantization is not None:
-            if self._config.model.training_mode == "full":
-                raise ValueError("Quantization is not supported in full training mode.")
-
-            logger.info(f'Quantizing model with "{self._config.acceleration.quantization}". This may take a while...')
+        if quantization is not None and load_time_cast is None:
+            logger.info(f'Quantizing model with "{quantization}". This may take a while...')
             self._transformer = quantize_model(
                 self._transformer,
-                precision=self._config.acceleration.quantization,
+                precision=quantization,
+                keep_on_device=self._config.acceleration.keep_quantized_model_on_gpu,
             )
 
         self._transformer.requires_grad_(False)
@@ -634,6 +716,10 @@ class LtxvTrainer:
         )
 
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
+
+        if self._config.acceleration.compile_transformer_blocks:
+            compiled = compile_block_forwards(transformer.transformer_blocks)
+            logger.info(f"Compiling {compiled} transformer block forwards with torch.compile (first step is slow)")
 
         # noinspection PyTypeChecker
         self._transformer = self._accelerator.prepare(self._transformer)
