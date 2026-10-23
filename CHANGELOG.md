@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `ltx-trainer`: `acceleration.quantization: fp8-cast` trains LoRA adapters over a base stored as `float8_e4m3fn` through ltx-core's fp8-cast policy, the same storage inference uses. The transformer is built straight on the GPU with no quantization pass and no tensor-subclass dispatch, so it loads in about a third of the time of `int8-quanto` at the same memory, steps about 15% faster, and works with `torch.compile`. `load_transformer()` takes an optional `quantization` policy.
+
 ### Fixed
 
 - `ltx-trainer` no longer runs a backward pass through the Gemma embeddings connectors on every training step. Their parameters defaulted to `requires_grad=True` although no optimizer reads their gradients; the embeddings processor is now frozen after loading and `create_embeddings` runs without autograd. On an RTX 5090 this cut peak training memory from 31.2 GB to 24.2 GB for a 576x576x73 audiovisual LoRA and from 25.5 GB to 22.0 GB for an audio-only one, and removed the connector backward from every step.

@@ -318,9 +318,18 @@ acceleration:
 | Parameter                             | Description                                                                                                                                                                              |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `mixed_precision_mode`                | Precision mode - `"bf16"` recommended for modern GPUs                                                                                                                                    |
-| `quantization`                        | Model quantization: `null`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`                                                                       |
+| `quantization`                        | Base-model quantization (LoRA training only): `null`, `"fp8-cast"`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`. See below.                   |
 | `load_text_encoder_in_8bit`           | Quantize the Gemma text encoder to 8-bit, saving ~8 GiB of VRAM while caption embeddings are computed. Works with both checkpoint layouts. Requires `bitsandbytes` and a CUDA device, and materializes the full-precision weights in host RAM first (~26 GB for LTX 2.5). **This can potentially degrade the cached caption features.** |
 | `offload_optimizer_during_validation` | Move optimizer state to CPU before validation video sampling and back afterwards. Useful when validation OOMs because VAE decoder + transformer + optimizer state can't coexist on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP. |
+
+**`fp8-cast` versus the quanto options.** The quanto options load the bf16 checkpoint into host RAM and then
+quantize it block by block; each quantized Linear is a tensor subclass that dequantizes on every call. `fp8-cast`
+reuses ltx-core's inference storage instead: the transformer-block Linears are written as `float8_e4m3fn` while the
+checkpoint streams straight onto the GPU, and each layer upcasts its weight inside a plain `nn.Linear` forward. It
+needs no extra dependency, skips the quantization pass (about 10 s to first step for LTX 2.5 on a fast disk, against
+35 s), and the layers are ordinary `nn.Linear` modules. Memory is the same
+one byte per weight as `int8-quanto`; on an RTX 5090 the training step was about 15% faster. LoRA adapters are
+created in bf16 and trained in fp32 as usual. Requires a GPU for loading (the float8 cast runs on the device).
 
 ### DataConfig
 

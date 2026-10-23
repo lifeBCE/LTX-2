@@ -47,7 +47,7 @@ from ltx_trainer.model_loader import (
     resolve_video_vae_path,
 )
 from ltx_trainer.progress import TrainingProgress
-from ltx_trainer.quantization import quantize_model
+from ltx_trainer.quantization import fp8_cast_policy, prepare_fp8_cast_linears_for_lora, quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
@@ -419,17 +419,35 @@ class LtxvTrainer:
 
     def _load_models(self) -> None:
         """Load the transformer and embeddings processor for training."""
-        logger.debug("Loading transformer...")
-        self._transformer = load_transformer(
-            checkpoint_path=self._config.model.model_path,
-            device="cpu",
-            dtype=torch.bfloat16,
-        )
+        quantization = self._config.acceleration.quantization
+        if quantization is not None and self._config.model.training_mode == "full":
+            raise ValueError("Quantization is not supported in full training mode.")
+        fp8_cast = quantization == "fp8-cast"
 
         # DDP-safe: LOCAL_RANK is set by accelerate before trainer init. Loading on bare
         # "cuda" would resolve to cuda:0 on every rank and crash with a device mismatch.
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+        logger.debug("Loading transformer...")
+        if fp8_cast:
+            # The policy writes the block Linears as float8 while the checkpoint streams in, so the model is
+            # built straight on the training device: no bf16 copy of the transformer in host RAM and no
+            # separate quantization pass.
+            self._transformer = load_transformer(
+                checkpoint_path=self._config.model.model_path,
+                device=init_device,
+                dtype=torch.bfloat16,
+                quantization=fp8_cast_policy(self._config.model.model_path),
+            )
+            fp8_layers = prepare_fp8_cast_linears_for_lora(self._transformer)
+            logger.info(f"Loaded transformer with {fp8_layers} float8 (fp8-cast) Linear layers")
+        else:
+            self._transformer = load_transformer(
+                checkpoint_path=self._config.model.model_path,
+                device="cpu",
+                dtype=torch.bfloat16,
+            )
 
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
@@ -447,17 +465,16 @@ class LtxvTrainer:
         # reads, and autograd keeps their activations alive until that backward.
         self._embeddings_processor.requires_grad_(False)
 
-        transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
-        self._transformer = self._transformer.to(dtype=transformer_dtype)
+        if not fp8_cast:
+            # (A dtype cast here would upcast fp8-cast weights back to bf16.)
+            transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
+            self._transformer = self._transformer.to(dtype=transformer_dtype)
 
-        if self._config.acceleration.quantization is not None:
-            if self._config.model.training_mode == "full":
-                raise ValueError("Quantization is not supported in full training mode.")
-
-            logger.info(f'Quantizing model with "{self._config.acceleration.quantization}". This may take a while...')
+        if quantization is not None and not fp8_cast:
+            logger.info(f'Quantizing model with "{quantization}". This may take a while...')
             self._transformer = quantize_model(
                 self._transformer,
-                precision=self._config.acceleration.quantization,
+                precision=quantization,
             )
 
         self._transformer.requires_grad_(False)

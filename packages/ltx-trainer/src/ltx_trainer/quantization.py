@@ -1,13 +1,19 @@
 # Adapted from: https://github.com/bghira/SimpleTuner
 # With improvements from: https://github.com/ostris/ai-toolkit
-from typing import Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from torch.autograd.function import FunctionCtx
 
 from ltx_trainer import logger
 
+if TYPE_CHECKING:
+    from ltx_core.quantization import QuantizationPolicy
+
 QuantizationOptions = Literal[
+    "fp8-cast",
     "int8-quanto",
     "int4-quanto",
     "int2-quanto",
@@ -49,6 +55,63 @@ SKIP_ROOT_MODULES = {
 }
 
 
+def fp8_cast_policy(checkpoint_path: str | Path) -> "QuantizationPolicy":
+    """ltx-core's fp8-cast policy for a transformer checkpoint.
+    Applied by ``load_transformer(quantization=...)``: the policy's state-dict ops write the transformer-block
+    Linears (``to_q/k/v``, ``to_out.0``, ``ff.net.*`` and their audio twins) as ``float8_e4m3fn`` while the
+    checkpoint streams in, and its module ops retype those layers to ``Fp8CastLinear``, which upcasts the weight
+    to the activation dtype inside a class-level forward. The same storage inference uses; no quantization pass.
+    Unlike the quanto options this is a plain ``nn.Linear`` subclass: no tensor-subclass dispatch, autograd
+    flows through ``F.linear``, and ``torch.compile`` can trace it.
+    """
+    from ltx_core.quantization.fp8_cast import build_policy  # noqa: PLC0415
+
+    return build_policy(str(checkpoint_path))
+
+
+class _Fp8FrozenLinearFunction(torch.autograd.Function):
+    """Linear over a frozen float8 weight.
+    ``F.linear(x, weight8.to(x.dtype))`` would save the upcast bf16 weight for backward, which without gradient
+    checkpointing keeps a second bf16 copy of every quantized Linear alive. This saves the float8 parameter
+    instead and upcasts again for the input gradient. No weight or bias gradient: the base model is frozen.
+    """
+
+    @staticmethod
+    def forward(ctx: FunctionCtx, x: torch.Tensor, weight8: torch.Tensor, bias8: torch.Tensor | None) -> torch.Tensor:
+        ctx.save_for_backward(weight8)
+        bias = bias8.to(x.dtype) if bias8 is not None else None
+        return torch.nn.functional.linear(x, weight8.to(x.dtype), bias)
+
+    @staticmethod
+    def backward(ctx: FunctionCtx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        (weight8,) = ctx.saved_tensors
+        return grad_out.matmul(weight8.to(grad_out.dtype)), None, None
+
+
+def _fp8_train_forward(self: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return _Fp8FrozenLinearFunction.apply(x, self.weight, self.bias)
+
+
+def prepare_fp8_cast_linears_for_lora(model: torch.nn.Module) -> int:
+    """Make a model loaded with :func:`fp8_cast_policy` ready for LoRA training. Returns the layer count.
+    * PEFT creates a new adapter in the base layer's weight dtype when that dtype is floating point, which
+      would make the adapters float8. PEFT prefers a ``compute_dtype`` attribute when present, so the adapters
+      are created in bfloat16 (and then upcast to float32 by PEFT's default ``autocast_adapter_dtype``).
+    * The forward is swapped at class level (keeping ``torch.compile`` happy) for one whose backward saves
+      the float8 weight rather than its bf16 upcast.
+    """
+    from ltx_core.quantization.fp8_cast import Fp8CastLinear  # noqa: PLC0415
+
+    train_cls = type("Fp8CastLinearTrain", (Fp8CastLinear,), {"forward": _fp8_train_forward})
+    count = 0
+    for module in model.modules():
+        if type(module) is Fp8CastLinear:
+            module.__class__ = train_cls
+            module.compute_dtype = torch.bfloat16
+            count += 1
+    return count
+
+
 def quantize_model(
     model: torch.nn.Module,
     precision: QuantizationOptions,
@@ -68,6 +131,12 @@ def quantize_model(
     Returns:
         The quantized model.
     """
+    if precision == "fp8-cast":
+        raise ValueError(
+            "fp8-cast is applied while the checkpoint loads: pass fp8_cast_policy(...) to load_transformer() "
+            "instead of calling quantize_model()."
+        )
+
     from optimum.quanto import freeze, quantize  # noqa: PLC0415
 
     if device is None:

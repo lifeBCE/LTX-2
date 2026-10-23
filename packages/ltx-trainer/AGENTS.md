@@ -67,7 +67,7 @@ packages/ltx-trainer/
 │   │   └── video_to_video.py     # VideoToVideoStrategy, VideoToVideoConfig [DEPRECATED]
 │   ├── timestep_samplers.py      # Flow matching timestep sampling
 │   ├── gemma_8bit.py             # 8-bit Gemma text encoder quantization (bitsandbytes)
-│   ├── quantization.py           # Transformer INT8/INT4/FP8 quantization
+│   ├── quantization.py           # Transformer quantization: quanto INT8/INT4/FP8, and fp8-cast (ltx-core float8 storage)
 │   ├── captioning.py             # Video captioning utilities
 │   ├── video_utils.py            # Video I/O and processing
 │   ├── gpu_utils.py              # GPU memory helpers
