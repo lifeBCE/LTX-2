@@ -143,8 +143,8 @@ The `configs/` directory is documented in two places that both contain a trainin
 2. `LtxvTrainer` class orchestrates the training loop
 3. Text encoder loaded on GPU → validation embeddings cached → heavy components unloaded (only `embeddings_processor`
    kept)
-4. Each training step: embedding connectors applied → strategy prepares `ModelInputs` → transformer forward pass →
-   strategy computes loss
+4. Each training step: embedding connectors applied (`apply_embeddings_connectors()`, frozen, no autograd) →
+   strategy prepares `ModelInputs` → transformer forward pass → strategy computes loss
 5. Training strategies (`FlexibleStrategy`) handle mode-specific logic including conditioning, masking, and loss computation
 6. Accelerate handles distributed training, mixed precision, and device placement
 7. Data flows as precomputed latents through `PrecomputedDataset`

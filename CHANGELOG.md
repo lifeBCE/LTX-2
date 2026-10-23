@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `ltx-trainer` no longer runs a backward pass through the Gemma embeddings connectors on every training step. Their parameters defaulted to `requires_grad=True` although no optimizer reads their gradients; the embeddings processor is now frozen after loading and `create_embeddings` runs without autograd. On an RTX 5090 this cut peak training memory from 31.2 GB to 24.2 GB for a 576x576x73 audiovisual LoRA and from 25.5 GB to 22.0 GB for an audio-only one, and removed the connector backward from every step.
+
 ## 1.5.0 - 2026-10-18
 
 ### Added
