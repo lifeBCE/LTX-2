@@ -428,6 +428,14 @@ class AccelerationConfig(ConfigBaseModel):
         "per-step logging.",
     )
 
+    fp8_gemm_min_rows: int = Field(
+        default=1024,
+        ge=1,
+        description="With quantization: fp8-gemm, the number of token rows from which a transformer Linear runs "
+        "its GEMMs in float8; shorter inputs take the fp8-cast upcast path. The per-row cast is a pass over "
+        "the activation, so the float8 GEMM only pays on long sequences.",
+    )
+
 
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""

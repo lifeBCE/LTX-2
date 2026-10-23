@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import importlib
 import math
 import os
@@ -32,6 +33,7 @@ from torch.optim.lr_scheduler import (
 )
 from torch.utils.data import DataLoader
 
+from ltx_core.quantization.fp8_cast import supports_fp8_gemm
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 from ltx_trainer import logger
@@ -50,8 +52,10 @@ from ltx_trainer.model_loader import (
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import (
     fp8_cast_policy,
+    fp8_gemm_policy,
     int8_cast_policy,
     prepare_fp8_cast_linears_for_lora,
+    prepare_fp8_gemm_linears_for_lora,
     prepare_int8_cast_linears_for_lora,
     quantize_model,
 )
@@ -457,6 +461,10 @@ class LtxvTrainer:
         # Bases quantized while the checkpoint streams in (ltx-core policies), then prepared for LoRA.
         load_time_cast = {
             "fp8-cast": (fp8_cast_policy, prepare_fp8_cast_linears_for_lora),
+            "fp8-gemm": (
+                functools.partial(fp8_gemm_policy, min_rows=self._config.acceleration.fp8_gemm_min_rows),
+                prepare_fp8_gemm_linears_for_lora,
+            ),
             "int8-cast": (int8_cast_policy, prepare_int8_cast_linears_for_lora),
         }.get(quantization)
 
@@ -479,6 +487,11 @@ class LtxvTrainer:
             )
             cast_layers = prepare_for_lora(self._transformer)
             logger.info(f"Loaded transformer with {cast_layers} {quantization} Linear layers")
+            if quantization == "fp8-gemm" and not supports_fp8_gemm(init_device):
+                logger.warning(
+                    f"{init_device} has no float8 GEMMs (compute capability 8.9 or newer); fp8-gemm layers will upcast "
+                    "their weights like fp8-cast"
+                )
         else:
             self._transformer = load_transformer(
                 checkpoint_path=self._config.model.model_path,

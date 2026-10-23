@@ -314,6 +314,7 @@ acceleration:
   compile_transformer_blocks: false             # torch.compile every transformer block
   keep_quantized_model_on_gpu: false            # Skip the CPU round trip after quanto quantization
   metrics_sync_interval: 1                      # Read loss/sigma back to the host every N steps
+  fp8_gemm_min_rows: 1024                       # fp8-gemm: rows from which a Linear's GEMMs run in float8
 ```
 
 **Key parameters:**
@@ -321,12 +322,13 @@ acceleration:
 | Parameter                             | Description                                                                                                                                                                              |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `mixed_precision_mode`                | Precision mode - `"bf16"` recommended for modern GPUs                                                                                                                                    |
-| `quantization`                        | Base-model quantization (LoRA training only): `null`, `"fp8-cast"`, `"int8-cast"`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`. See below.                   |
+| `quantization`                        | Base-model quantization (LoRA training only): `null`, `"fp8-cast"`, `"fp8-gemm"`, `"int8-cast"`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`. See below.                   |
 | `load_text_encoder_in_8bit`           | Quantize the Gemma text encoder to 8-bit, saving ~8 GiB of VRAM while caption embeddings are computed. Works with both checkpoint layouts. Requires `bitsandbytes` and a CUDA device, and materializes the full-precision weights in host RAM first (~26 GB for LTX 2.5). **This can potentially degrade the cached caption features.** |
 | `offload_optimizer_during_validation` | Move optimizer state to CPU before validation video sampling and back afterwards. Useful when validation OOMs because VAE decoder + transformer + optimizer state can't coexist on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP. |
 | `compile_transformer_blocks`          | Compile every transformer block's forward with `torch.compile(dynamic=True)`. The first step pays the compilation (about 40 s for LTX 2.5 at batch 1, longer at larger batches); afterwards one artifact serves every sequence length. Measured about 2x faster steps on an RTX 5090 with `int8-quanto` and with `fp8-cast` on an audio-only LoRA, 1.6x on an audiovisual one. Works with every quantization option. |
 | `keep_quantized_model_on_gpu`         | After block-wise quanto quantization keep the quantized blocks on the GPU instead of moving them back to the CPU until Accelerate prepares the model. Saves two PCIe passes of the model at startup (about 10 s on a PCIe 4.0 x16 link, far more on narrower links). Leave off under FSDP, which shards the model from the CPU. |
 | `metrics_sync_interval`               | Read the loss and sigma back to the host every N optimization steps (always on the last). Each read is a full GPU synchronization that stops the CPU from queueing the next step; with small steps this shows up as idle GPU time. 1 keeps per-step logging. |
+| `fp8_gemm_min_rows`                   | With `quantization: fp8-gemm`, the number of token rows from which a transformer Linear runs its GEMMs in float8; shorter inputs (the audio and text-context projections, short clips) take the `fp8-cast` upcast path. The per-row cast is a pass over the activation, so the float8 GEMM only pays on long sequences; 1024 was the break-even on an RTX 5090. |
 
 **`fp8-cast` versus the quanto options.** The quanto options load the bf16 checkpoint into host RAM and then
 quantize it block by block; each quantized Linear is a tensor subclass that dequantizes on every call. `fp8-cast`
@@ -344,6 +346,19 @@ per weight, needs no quantization pass and no quanto dispatch, and compiles like
 compiled step matched `fp8-cast` (0.20 s audio-only, 1.23 s audiovisual at 576x576x73) and was 12% faster than
 compiled `int8-quanto` on the audio-only config. Prefer it over `fp8-cast` when precision matters more than the
 fp8 storage shared with inference.
+
+**`fp8-gemm`** is `fp8-cast` storage with the frozen base's GEMMs themselves in float8. The block Linears are
+ltx-core's `Fp8RowwiseLinear`, the rowwise fp8 GEMM the pipelines use for inference: a bf16 activation of at least
+`fp8_gemm_min_rows` rows is rounded to e4m3 with one scale per row and multiplied with the stored e4m3 weight
+through `torch._scaled_mm`. For training the input gradient takes the same route (the output gradient rounded
+per row, multiplied with the transposed weight); adapters, norms and attention stay in bf16, and the base gets no
+weight gradient. Needs a GPU with compute capability 8.9 or newer (Ada, Hopper, Blackwell); elsewhere the layers
+upcast like `fp8-cast`. Lossy: activations and gradients through the frozen base keep e4m3's 3 mantissa bits. On
+an RTX 5090 the compiled audiovisual step went from 1.19 s to 0.90 s (576x576x73, batch 1) with losses within
+0.6% of `fp8-cast` over 60 steps, and a 300-step audiovisual adapter scored the same as `fp8-cast`, `int8-cast`
+and `int8-quanto` adapters on word error rate, lip-sync estimate and speaker similarity. Audio-only configs stay
+below the row threshold and run at `fp8-cast` speed. Pair it with `compile_transformer_blocks`, which fuses the
+per-row cast into the kernels producing the activations.
 
 ### DataConfig
 
